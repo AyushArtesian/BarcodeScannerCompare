@@ -3,6 +3,7 @@ import pandas as pd
 import requests
 from datetime import datetime, timedelta
 from azure.data.tables import TableClient
+from collections import Counter
 import json
 import os
 import re
@@ -21,6 +22,14 @@ SPLIT_FILE_PATTERN = re.compile(r'^(.+)_(\d+)_(\d+)\.pdf$', re.IGNORECASE)
 
 # BarcodeScanBy values that mean "not scanned by Inlite"
 NOT_SCANNED_VALUES = {'', 'none', 'null', 'nan'}
+
+# Page values that mean "no real page number" (these are never counted)
+NA_PAGE_VALUES = {'', 'n/a', 'na', 'none', 'null', 'nan'}
+
+# Columns kept from the Azure Table side before merging
+PYTHON_MERGE_COLS = [
+    'BlobBackupFilePath', 'PythonCount', 'PythonCreatedAt', 'PythonPairs', 'DateKey'
+]
 
 
 # Page configuration
@@ -94,6 +103,44 @@ def is_barcode_scanned_by_inlite(value):
     return str(value).strip().lower() not in NOT_SCANNED_VALUES
 
 
+def is_valid_page(value):
+    """True only when a page number is a real value (not None, blank, or N/A)."""
+    if is_empty_value(value):
+        return False
+    return str(value).strip().lower() not in NA_PAGE_VALUES
+
+
+def normalize_page(value):
+    """Return the page as an int, or None if it is missing, N/A, or not a number."""
+    if not is_valid_page(value):
+        return None
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_rono(value):
+    """Return the repair order as a clean string, or None if it is missing or N/A."""
+    if is_empty_value(value):
+        return None
+    text = str(value).strip()
+    if text.lower() in NA_PAGE_VALUES:
+        return None
+    if text.endswith('.0'):
+        text = text[:-2]
+    return text
+
+
+def make_barcode_pair(page_value, rono_value):
+    """Return (page, repair order), or None when either part is missing."""
+    page = normalize_page(page_value)
+    rono = normalize_rono(rono_value)
+    if page is None or rono is None:
+        return None
+    return page, rono
+
+
 def find_column(df, candidates):
     """Find a column ignoring case and underscores."""
     lookup = {c.replace('_', '').lower(): c for c in df.columns}
@@ -156,27 +203,72 @@ def find_endpage_in_record(rec):
     return None
 
 
-def build_inlite_barcode_rows(records):
-    """Convert scanned Inlite records into the same shape as the Python barcode details.
+def get_record_page(rec):
+    """Return the Inlite record's page number, or None if it is missing or N/A.
 
-    Page # comes from the endpage in the split filename, if the record has one.
-    Repair Order comes from RecordKey.
+    Inlite has no page field, so the page comes from the endpage of the split
+    file name. An explicit N/A is never replaced, it is excluded.
     """
-    rows = []
-    for rec in records:
-        page = get_field(rec, ['pagenumber', 'page', 'pageno', 'pagenum'])
-        if page is None:
-            page = find_endpage_in_record(rec)
-        rono = get_field(rec, ['recordkey'])
-        rows.append({
-            'Page #': page if page is not None else 'N/A',
-            'Repair Order': str(rono) if rono is not None else 'N/A'
-        })
-    return rows
+    page = get_field(rec, ['pagenumber', 'page', 'pageno', 'pagenum'])
+    if page is None:
+        page = find_endpage_in_record(rec)
+    return page if is_valid_page(page) else None
 
 
-def fetch_inlite_data(company_code, date_from, date_to):
-    """Fetch data from Inlite API"""
+def parse_python_barcodes(pagenumber):
+    """Return the Azure Table pagenumber list as (page, repair order) pairs.
+
+    Azure stores it like [{"page": 1, "rono": "21588659"}, ...]. Entries with
+    an N/A page or a missing repair order are skipped.
+    """
+    try:
+        data = pagenumber
+        if isinstance(data, str):
+            data = json.loads(data)
+        if not isinstance(data, list):
+            return []
+        pairs = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            pair = make_barcode_pair(item.get('page'), item.get('rono'))
+            if pair is not None:
+                pairs.append(pair)
+        return pairs
+    except Exception:
+        return []
+
+
+def has_python_pagenumber(pagenumber):
+    """True when the Azure Table pagenumber is not empty (ignores '[]', blank, and null)."""
+    if is_empty_value(pagenumber):
+        return False
+    parsed = pagenumber
+    if isinstance(pagenumber, str):
+        try:
+            parsed = json.loads(pagenumber.strip())
+        except Exception:
+            return pagenumber.strip() not in ('', '[]', 'null')
+    if isinstance(parsed, list):
+        return len(parsed) > 0
+    return not is_empty_value(parsed)
+
+
+def count_barcode_differences(inline_pairs, python_pairs):
+    """Compare two lists of (page, repair order) pairs.
+
+    Returns (missing_in_python, extra_in_python). Duplicates are counted,
+    so the same barcode on the same page twice is handled correctly.
+    """
+    inline_counts = Counter(inline_pairs)
+    python_counts = Counter(python_pairs)
+    missing = sum((inline_counts - python_counts).values())
+    extra = sum((python_counts - inline_counts).values())
+    return missing, extra
+
+
+def fetch_inlite_data(date_from, date_to):
+    """Fetch data from Inlite API - date range only (no company code)"""
     try:
         url = f"{API_BASE_URL}/api/t/{int(url_tenant_id)}/e/{int(url_enterprise_id)}/s/{int(url_store_id)}/filebunker/logs/list"
 
@@ -191,8 +283,11 @@ def fetch_inlite_data(company_code, date_from, date_to):
             "UrlStoreId": int(url_store_id),
             "StartDate": date_from.isoformat(),
             "EndDate": date_to.isoformat(),
-            "CompanyCode": company_code
+            "IsOnDemand": True
         }
+
+        st.write(f"**Debug - API URL:** `{url}`")
+        st.write(f"**Debug - Payload:** {payload}")
 
         with st.spinner("Calling Inlite API..."):
             response = requests.get(url, headers=headers, json=payload, timeout=30)
@@ -224,8 +319,8 @@ def fetch_inlite_data(company_code, date_from, date_to):
         return pd.DataFrame()
 
 
-def fetch_python_data(company_code, date_from, date_to):
-    """Fetch Azure Table Storage records by Store, then filter CreatedAt locally.
+def fetch_python_data(date_from, date_to):
+    """Fetch Azure Table Storage records by date range only - no store filter.
 
     CreatedAt may be stored as a String property rather than an Azure Table
     Edm.DateTime value. Filtering it in the Table query with datetime literals
@@ -241,21 +336,20 @@ def fetch_python_data(company_code, date_from, date_to):
             AZURE_TABLE_NAME
         )
 
-        # Escape apostrophes for an OData string literal.
-        escaped_company_code = str(company_code).replace("'", "''")
-        filter_query = f"Store eq '{escaped_company_code}'"
-
+        # Fetch all records without store filter - we'll filter by date locally
+        # Pass empty filter to get all records
         with st.spinner("Querying Azure Table Storage..."):
-            entities = list(table_client.query_entities(query_filter=filter_query))
+            entities = list(table_client.query_entities(query_filter=""))
 
         if not entities:
             st.warning(
-                f"No records found in Azure Table Storage for Store '{company_code}'. "
-                "Check the table name, storage connection string, and Store value."
+                f"No records found in Azure Table Storage. "
+                "Check the table name and storage connection string."
             )
             return pd.DataFrame()
 
         data = pd.DataFrame(entities)
+        st.write(f"**Debug - Azure Table Records:** {len(entities)} total records in table")
 
         # CreatedAt is stored as a string in the supplied table export, so parse
         # it locally instead of applying Azure Edm.DateTime query filters.
@@ -273,7 +367,7 @@ def fetch_python_data(company_code, date_from, date_to):
 
         if data.empty:
             st.warning(
-                f"Records exist for Store '{company_code}', but none have CreatedAt "
+                f"Records exist in Azure Table Storage, but none have CreatedAt "
                 f"between {date_from.isoformat()} and {date_to.isoformat()}."
             )
             return pd.DataFrame()
@@ -285,92 +379,26 @@ def fetch_python_data(company_code, date_from, date_to):
         return pd.DataFrame()
 
 
-def get_barcode_count_from_python(pagenumber):
-    """Extract barcode count from pagenumber array"""
-    try:
-        if isinstance(pagenumber, str):
-            pagenumber = json.loads(pagenumber)
-        if isinstance(pagenumber, list):
-            return len(pagenumber)
-        return 0
-    except Exception:
-        return 0
-
-
-def get_file_count_from_python(original_filename):
-    """Extract file count from OriginalFileName array"""
-    try:
-        if isinstance(original_filename, str):
-            original_filename = json.loads(original_filename)
-        if isinstance(original_filename, list):
-            return len(original_filename)
-        return 0
-    except Exception:
-        return 0
-
-
-def parse_page_details(pagenumber, original_filename):
-    """Parse page details for the details view"""
-    try:
-        # Handle OriginalFileName
-        files = []
-        if original_filename:
-            if isinstance(original_filename, str):
-                try:
-                    files = json.loads(original_filename)
-                except Exception:
-                    try:
-                        cleaned = original_filename.replace('""', '"')
-                        files = json.loads(cleaned)
-                    except Exception:
-                        files = [original_filename]
-            elif isinstance(original_filename, list):
-                files = original_filename
-
-        # Handle pagenumber
-        pages = []
-        if pagenumber:
-            if isinstance(pagenumber, str):
-                try:
-                    pages = json.loads(pagenumber)
-                except Exception:
-                    try:
-                        cleaned = pagenumber.replace('""', '"')
-                        pages = json.loads(cleaned)
-                    except Exception:
-                        pages = []
-            elif isinstance(pagenumber, list):
-                pages = pagenumber
-
-        # Ensure they are lists
-        if not isinstance(files, list):
-            files = [files] if files else []
-        if not isinstance(pages, list):
-            pages = [pages] if pages else []
-
-        return {'files': files, 'pages': pages}
-    except Exception:
-        return {'files': [], 'pages': []}
-
-
 def compare_results(inlite_df, python_df):
-    """Normalize both data sources and compare their barcode counts."""
+    """Compare barcodes per file as (page, repair order) pairs.
+
+    Inlite: RecordKey is the repair order, the split file name endpage is the page.
+    Python: pagenumber holds [{"page": n, "rono": "..."}].
+    """
     if inlite_df.empty and python_df.empty:
         return pd.DataFrame()
 
     try:
-        # Normalize Inlite data
+        # ---------- Normalize Inlite data ----------
         if inlite_df.empty:
             inlite_data = pd.DataFrame(columns=[
-                'StoreCode', 'BlobBackupFilePath', 'OriginalFileName',
-                'InliteCount', 'BarcodeKeys', 'CreatedAt', 'DateKey'
+                'BlobBackupFilePath', 'InlinePairs', 'InliteCount', 'CreatedAt', 'DateKey'
             ])
         else:
             inlite_data_source = inlite_df.copy()
 
             # Normalize column names (case-insensitive)
             api_column_map = {
-                'storecode': 'StoreCode',
                 'blobbackuppath': 'BlobBackupFilePath',
                 'blobbackupfilepath': 'BlobBackupFilePath',
                 'originalfilename': 'OriginalFileName',
@@ -387,7 +415,7 @@ def compare_results(inlite_df, python_df):
 
             inlite_data_source.rename(columns=rename_dict, inplace=True)
 
-            required = ['StoreCode', 'BlobBackupFilePath', 'CreatedAt']
+            required = ['BlobBackupFilePath', 'CreatedAt']
             missing = [col for col in required if col not in inlite_data_source.columns]
             if missing:
                 st.error(f"Inlite API missing columns: {missing}")
@@ -409,136 +437,121 @@ def compare_results(inlite_df, python_df):
 
             # Only rows scanned by Inlite (BarcodeScanBy has a value) are counted.
             scanned_mask = inlite_data_source['BarcodeScanBy'].apply(is_barcode_scanned_by_inlite)
-            scanned_rows = inlite_data_source[scanned_mask]
+            scanned_rows = inlite_data_source[scanned_mask].copy()
 
-            scanned_counts = (
-                scanned_rows
-                .groupby(['StoreCode', 'BlobBackupFilePath'], as_index=False)
-                .agg(
-                    InliteCount=('RecordKey', 'size'),
-                    BarcodeKeys=('RecordKey', lambda s: sorted({str(x) for x in s if not is_empty_value(x)})),
-                )
-            )
+            # One (page, repair order) pair per scanned record. N/A pages are skipped.
+            pairs_by_file = {}
+            for rec in scanned_rows.to_dict('records'):
+                pair = make_barcode_pair(get_record_page(rec), get_field(rec, ['recordkey']))
+                if pair is None:
+                    continue
+                file_key = str(rec.get('BlobBackupFilePath', '')).strip()
+                pairs_by_file.setdefault(file_key, []).append(pair)
 
-            inlite_base = (
+            inlite_data = (
                 inlite_data_source
-                .groupby(['StoreCode', 'BlobBackupFilePath'], as_index=False)
-                .agg(
-                    OriginalFileName=('OriginalFileName', 'first'),
-                    CreatedAt=('CreatedAt', 'min'),
-                )
+                .groupby(['BlobBackupFilePath'], as_index=False)
+                .agg(CreatedAt=('CreatedAt', 'min'))
             )
-
-            inlite_data = inlite_base.merge(
-                scanned_counts, on=['StoreCode', 'BlobBackupFilePath'], how='left'
+            inlite_data['InlinePairs'] = inlite_data['BlobBackupFilePath'].apply(
+                lambda p: list(pairs_by_file.get(str(p).strip(), []))
             )
-            inlite_data['InliteCount'] = inlite_data['InliteCount'].fillna(0).astype(int)
-            inlite_data['BarcodeKeys'] = inlite_data['BarcodeKeys'].apply(
-                lambda v: v if isinstance(v, list) else []
-            )
+            inlite_data['InliteCount'] = inlite_data['InlinePairs'].apply(len)
             inlite_data['DateKey'] = inlite_data['CreatedAt'].dt.date
 
-        # Normalize Azure Table data
+        # ---------- Normalize Azure Table data ----------
         if python_df.empty:
-            python_data = pd.DataFrame(columns=[
-                'StoreCode', 'BlobBackupFilePath', 'OriginalFileName',
-                'PythonCount', 'FileCount', 'CreatedAt', 'pagenumber', 'DateKey'
-            ])
+            python_data = pd.DataFrame(columns=PYTHON_MERGE_COLS)
         else:
             python_data = python_df.copy()
 
-            required = ['Store', 'BlobBackupFilePath', 'CreatedAt', 'pagenumber']
+            required = ['BlobBackupFilePath', 'CreatedAt', 'pagenumber']
             missing = [col for col in required if col not in python_data.columns]
             if missing:
                 st.error(f"Azure Table missing columns: {missing}")
                 st.write("Available columns:", list(python_data.columns))
                 return pd.DataFrame()
 
-            python_data['PythonCount'] = python_data['pagenumber'].apply(get_barcode_count_from_python)
-            python_data['FileCount'] = python_data['OriginalFileName'].apply(get_file_count_from_python)
-            python_data['CreatedAt'] = pd.to_datetime(python_data['CreatedAt'], errors='coerce', utc=True)
-            python_data.rename(columns={'Store': 'StoreCode'}, inplace=True)
-            python_data['DateKey'] = python_data['CreatedAt'].dt.date
+            python_data['PythonPairs'] = python_data['pagenumber'].apply(parse_python_barcodes)
+            python_data['PythonCount'] = python_data['PythonPairs'].apply(len)
+            python_data['PythonCreatedAt'] = pd.to_datetime(python_data['CreatedAt'], errors='coerce', utc=True)
+            python_data['DateKey'] = python_data['PythonCreatedAt'].dt.date
 
-            python_data = python_data[[
-                'StoreCode', 'BlobBackupFilePath', 'OriginalFileName',
-                'PythonCount', 'FileCount', 'CreatedAt', 'pagenumber', 'DateKey'
-            ]].copy()
+            python_data = python_data[PYTHON_MERGE_COLS].copy()
 
-        # INNER JOIN - only matching files
+        # ---------- Match files: same file and same day first, then file only ----------
         comparison = pd.merge(
             inlite_data,
-            python_data[[
-                'StoreCode', 'BlobBackupFilePath', 'OriginalFileName',
-                'PythonCount', 'FileCount', 'CreatedAt', 'pagenumber', 'DateKey'
-            ]],
-            on=['StoreCode', 'BlobBackupFilePath', 'DateKey'],
-            how='inner',
-            suffixes=('_inlite', '_python')
+            python_data,
+            on=['BlobBackupFilePath', 'DateKey'],
+            how='inner'
         )
 
         if len(comparison) == 0:
             comparison = pd.merge(
                 inlite_data,
-                python_data[[
-                    'StoreCode', 'BlobBackupFilePath', 'OriginalFileName',
-                    'PythonCount', 'FileCount', 'CreatedAt', 'pagenumber'
-                ]],
-                on=['StoreCode', 'BlobBackupFilePath'],
-                how='inner',
-                suffixes=('_inlite', '_python')
+                python_data.drop(columns=['DateKey']),
+                on=['BlobBackupFilePath'],
+                how='inner'
             )
 
         if len(comparison) == 0:
             st.error("No matching records found between Inlite and Azure data!")
+            st.write("**Debug Info:**")
+            st.write(f"Inlite records (after normalization): {len(inlite_data)}")
+            if len(inlite_data) > 0:
+                st.write("Inlite columns:", list(inlite_data.columns))
+                st.write("Inlite sample BlobBackupFilePath values:", inlite_data['BlobBackupFilePath'].head(3).tolist())
+            st.write(f"Python records (after normalization): {len(python_data)}")
+            if len(python_data) > 0:
+                st.write("Python columns:", list(python_data.columns))
+                st.write("Python sample BlobBackupFilePath values:", python_data['BlobBackupFilePath'].head(3).tolist())
             return pd.DataFrame()
 
-        # Handle CreatedAt columns (may be suffixed if they came from both sources)
-        if 'CreatedAt_inlite' in comparison.columns:
-            comparison['CreatedAt'] = comparison['CreatedAt_inlite']
-            comparison.drop(columns=['CreatedAt_inlite'], inplace=True)
-        if 'CreatedAt_python' in comparison.columns:
-            comparison.drop(columns=['CreatedAt_python'], inplace=True)
-
-        comparison.drop(columns=['DateKey'], errors='ignore', inplace=True)
-
-        if 'CreatedAt' not in comparison.columns:
-            st.error("CreatedAt column missing after merge!")
-            return pd.DataFrame()
-
-        # Calculate differences
+        # ---------- Compare barcodes ----------
         comparison['Difference'] = comparison['InliteCount'] - comparison['PythonCount']
-        comparison['Match'] = comparison.apply(
-            lambda row: 'MATCH' if row['InliteCount'] == row['PythonCount'] else 'MISMATCH',
-            axis=1
-        )
 
-        final_cols = [
-            'StoreCode', 'BlobBackupFilePath', 'InliteCount', 'PythonCount',
-            'FileCount', 'Difference', 'Match', 'CreatedAt', 'BarcodeKeys'
+        diffs = [
+            count_barcode_differences(inline_pairs, python_pairs)
+            for inline_pairs, python_pairs in zip(comparison['InlinePairs'], comparison['PythonPairs'])
+        ]
+        comparison['MissingInPython'] = [missing for missing, _ in diffs]
+        comparison['ExtraInPython'] = [extra for _, extra in diffs]
+        comparison['Match'] = [
+            'MATCH' if missing == 0 and extra == 0 else 'MISMATCH'
+            for missing, extra in diffs
         ]
 
-        if 'OriginalFileName_inlite' in comparison.columns:
-            final_cols.append('OriginalFileName_inlite')
-        if 'OriginalFileName_python' in comparison.columns:
-            final_cols.append('OriginalFileName_python')
-        if 'OriginalFileName' in comparison.columns and 'OriginalFileName_inlite' not in comparison.columns and 'OriginalFileName_python' not in comparison.columns:
-            final_cols.append('OriginalFileName')
+        final_cols = [
+            'BlobBackupFilePath', 'InliteCount', 'PythonCount',
+            'Difference', 'MissingInPython', 'ExtraInPython', 'Match',
+            'CreatedAt', 'InlinePairs', 'PythonPairs'
+        ]
 
-        if 'pagenumber' in comparison.columns:
-            final_cols.append('pagenumber')
-
-        return comparison[final_cols].sort_values('CreatedAt', ascending=False, na_position='last').reset_index(drop=True)
+        return (
+            comparison[final_cols]
+            .sort_values('CreatedAt', ascending=False, na_position='last')
+            .reset_index(drop=True)
+        )
 
     except Exception as e:
         st.error(f"Error comparing results: {str(e)}")
         return pd.DataFrame()
 
 
-def run_search(company_code, date_from, date_to):
-    """Fetch both sources, build the comparison, and store everything in session state."""
-    inlite_df = fetch_inlite_data(company_code, date_from, date_to)
-    python_df = fetch_python_data(company_code, date_from, date_to)
+def run_search(date_from, date_to):
+    """Fetch both sources, keep only Azure rows with a page number, build the comparison, and store it."""
+    inlite_df = fetch_inlite_data(date_from, date_to)
+    python_df = fetch_python_data(date_from, date_to)
+
+    # Compare only files whose Azure Table pagenumber is not empty
+    if not python_df.empty and 'pagenumber' in python_df.columns:
+        python_df = python_df[python_df['pagenumber'].apply(has_python_pagenumber)].reset_index(drop=True)
+
+    # Debug info
+    st.write(f"**Debug - Raw Record Counts:**")
+    st.write(f"- Inlite API returned: {len(inlite_df)} records")
+    st.write(f"- Azure Table returned (with pagenumber): {len(python_df)} records")
 
     # Index raw Inlite records by file path for the details view
     records_by_path = {}
@@ -579,72 +592,68 @@ def render_sidebar_summary():
 
 
 def render_file_details(row, records_by_path):
-    """Detailed view for one selected file."""
+    """Detailed view for one selected file: barcode-by-barcode comparison."""
     blob_path = row['BlobBackupFilePath']
     all_recs = records_by_path.get(str(blob_path).strip().lower(), [])
+
+    # Inlite records that were scanned by Inlite
     scanned_recs = [
         rec for rec in all_recs
         if is_barcode_scanned_by_inlite(get_field(rec, ['barcodescanby']))
     ]
-    excluded = len(all_recs) - len(scanned_recs)
+    inlite_na_count = sum(1 for rec in scanned_recs if get_record_page(rec) is None)
 
-    python_filename = row.get('OriginalFileName_python', row.get('OriginalFileName', None))
-    python_details = parse_page_details(row.get('pagenumber', None), python_filename)
-    python_files = python_details['files']
-    python_pages = python_details['pages']
+    inline_pairs = row['InlinePairs'] if isinstance(row['InlinePairs'], list) else []
+    python_pairs = row['PythonPairs'] if isinstance(row['PythonPairs'], list) else []
+
+    inline_counts = Counter(inline_pairs)
+    python_counts = Counter(python_pairs)
+
+    # One line per (page, repair order) found on either side
+    detail_rows = []
+    for page, rono in sorted(set(inline_counts) | set(python_counts)):
+        inline_n = inline_counts.get((page, rono), 0)
+        python_n = python_counts.get((page, rono), 0)
+        if inline_n == python_n:
+            status = '✅ Match'
+        elif inline_n > python_n:
+            status = '❌ Missing in Python'
+        else:
+            status = '❌ Extra in Python'
+        detail_rows.append({
+            'Page #': page,
+            'Repair Order': rono,
+            'Inlite Count': inline_n,
+            'Python Count': python_n,
+            'Status': status,
+        })
 
     with st.container(border=True):
         st.markdown(f"**File:** `{blob_path}`")
 
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3, m4, m5 = st.columns(5)
         with m1:
-            st.metric("Inlite Count", row['InliteCount'])
+            st.metric("Inlite Barcodes", len(inline_pairs))
         with m2:
-            st.metric("Python Count", row['PythonCount'])
+            st.metric("Python Barcodes", len(python_pairs))
         with m3:
-            st.metric("Difference", row['Difference'])
+            st.metric("Missing in Python", int(row['MissingInPython']))
+        with m4:
+            st.metric("Extra in Python", int(row['ExtraInPython']))
+        with m5:
+            st.metric("Inlite N/A (excluded)", inlite_na_count)
 
         st.write(f"**Status:** {row['Match']}")
         st.divider()
 
-        c1, c2 = st.columns(2)
+        st.subheader("Barcode Comparison (Page + Repair Order)")
+        if detail_rows:
+            st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No barcode data to compare")
 
-        with c1:
-            st.subheader("Inlite Barcodes")
-            if scanned_recs:
-                st.dataframe(
-                    pd.DataFrame(build_inlite_barcode_rows(scanned_recs)).astype(str),
-                    use_container_width=True,
-                    hide_index=True
-                )
-            else:
-                st.info("No barcodes scanned by Inlite")
-            st.caption(f"Total: {row['InliteCount']} barcode(s) scanned by Inlite")
-            st.caption(f"Records excluded (BarcodeScanBy empty): {excluded}")
-
-        with c2:
-            st.subheader("Python Files")
-            if python_files:
-                for i, file in enumerate(python_files, 1):
-                    st.write(f"{i}. {file}")
-            else:
-                st.info("No files found in Python")
-
-            st.subheader("Python Barcodes")
-            page_data = []
-            for page_info in python_pages:
-                if isinstance(page_info, dict):
-                    page_data.append({
-                        'Page #': page_info.get('page', 'N/A'),
-                        'Repair Order': page_info.get('rono', 'N/A')
-                    })
-            if page_data:
-                st.dataframe(pd.DataFrame(page_data), use_container_width=True, hide_index=True)
-            else:
-                st.info("No barcode details found")
-            st.caption(f"Total: {row['PythonCount']} barcode(s) detected")
-
-        st.caption(f"Created: {row['CreatedAt']}")
+        st.divider()
+        st.metric("Created", str(row['CreatedAt']).split()[0])
 
 
 def comparison_page():
@@ -652,61 +661,85 @@ def comparison_page():
 
     # Search & Filter
     st.subheader("Search & Filter")
-    col1, col2, col3, col4 = st.columns(4)
 
+    col1, col2 = st.columns(2)
     with col1:
-        company_code = st.text_input(
-            "Company Code",
-            value="SC1",
-            placeholder="e.g., SC1",
-            help="Company code from your system"
-        )
-    with col2:
         date_from = st.date_input(
             "Start Date",
-            value=datetime.now() - timedelta(days=7),
-            help="Start date for filtering"
+            value=datetime.now().date() - timedelta(days=2),
+            help="Select the start date for your search"
         )
-    with col3:
+    with col2:
         date_to = st.date_input(
             "End Date",
-            value=datetime.now(),
-            help="End date for filtering"
+            value=datetime.now().date(),
+            help="Select the end date for your search"
         )
-    with col4:
-        st.write("")
-        st.write("")
+
+    # Validate date range: must be <= 2 days
+    date_diff = (date_to - date_from).days
+
+    st.divider()
+
+    if date_from > date_to:
+        st.error("❌ Start Date cannot be after End Date!")
+        search_button = st.button("Search & Compare", use_container_width=True, disabled=True)
+    elif date_diff > 2:
+        st.error(f"❌ Date range is {date_diff} days. Maximum allowed is 2 days.")
+        st.caption("Please select dates within 2 days of each other.")
+        search_button = st.button("Search & Compare", use_container_width=True, disabled=True)
+    else:
+        st.success(f"✅ Date range is valid ({date_diff} day{'s' if date_diff != 1 else ''}) - Ready to search")
         search_button = st.button("Search & Compare", use_container_width=True)
 
     if search_button:
-        if not company_code:
-            st.error("Please enter a Company Code")
-        elif not API_BASE_URL or not API_BEARER_TOKEN or not AZURE_STORAGE_CONNECTION_STRING:
+        if not API_BASE_URL or not API_BEARER_TOKEN or not AZURE_STORAGE_CONNECTION_STRING:
             st.error("Please configure API and Azure settings in sidebar")
         else:
             with st.spinner("Fetching data from both systems..."):
-                run_search(company_code, date_from, date_to)
+                run_search(date_from, date_to)
 
     st.divider()
 
     if not st.session_state.searched:
-        st.info("Choose your filters and click Search & Compare.")
+        st.info("Click Search & Compare to fetch data.")
         return
 
     comparison_df = st.session_state.comparison_df
     if comparison_df.empty:
-        st.info("No data found. Try adjusting filters or checking your configuration.")
+        st.info("No data found. Try checking your configuration.")
         return
 
-    # Results table with a View option
+    # Results table with search and a View option
     st.subheader(f"Comparison Results ({len(comparison_df)} records)")
-    st.caption("Tick **View** on a row to show its details below.")
+
+    search_text = st.text_input(
+        "Search by file path",
+        placeholder="Type part of a file path, e.g. SchompAutoGroup or Booklet_6925370",
+        key="file_path_search",
+    )
 
     view_df = comparison_df.reset_index(drop=True)
-    table_df = view_df[[
-        'StoreCode', 'BlobBackupFilePath', 'InliteCount', 'PythonCount',
-        'FileCount', 'Difference', 'Match', 'CreatedAt'
-    ]].copy()
+    if search_text.strip():
+        path_mask = view_df['BlobBackupFilePath'].astype(str).str.contains(
+            search_text.strip(), case=False, regex=False, na=False
+        )
+        view_df = view_df[path_mask].reset_index(drop=True)
+
+    if view_df.empty:
+        st.info(f"No files match \"{search_text.strip()}\".")
+        return
+
+    st.caption(
+        f"Showing {len(view_df)} of {len(comparison_df)} files. "
+        "Tick **View** on a row to show its barcode details below."
+    )
+
+    table_cols = [
+        'BlobBackupFilePath', 'InliteCount', 'PythonCount',
+        'Difference', 'Match', 'CreatedAt'
+    ]
+    table_df = view_df[table_cols].copy()
     table_df['CreatedAt'] = (
         pd.to_datetime(table_df['CreatedAt'], errors='coerce', utc=True)
         .dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -714,19 +747,18 @@ def comparison_page():
     )
     table_df.insert(0, 'View', False)
 
+    # Key includes the search text so View ticks reset when the filter changes
     edited = st.data_editor(
         table_df,
-        key='results_editor',
+        key=f"results_editor_{search_text.strip().lower()}",
         hide_index=True,
         use_container_width=True,
         disabled=[c for c in table_df.columns if c != 'View'],
         column_config={
             'View': st.column_config.CheckboxColumn('View', help='Show details for this file', default=False),
-            'StoreCode': st.column_config.TextColumn('Store', width='small'),
             'BlobBackupFilePath': st.column_config.TextColumn('File Path', width='large'),
             'InliteCount': st.column_config.NumberColumn('Inlite Barcode Count', format='%d'),
             'PythonCount': st.column_config.NumberColumn('Python Barcode Count', format='%d'),
-            'FileCount': st.column_config.NumberColumn('Files Scanned', format='%d'),
             'Difference': st.column_config.NumberColumn('Difference', format='%d'),
             'Match': st.column_config.TextColumn('Match', width='small'),
             'CreatedAt': st.column_config.TextColumn('Created At', width='medium'),
@@ -743,41 +775,55 @@ def comparison_page():
 
     st.divider()
 
-    # Export
-    export_df = view_df[[
-        'StoreCode', 'BlobBackupFilePath', 'InliteCount',
-        'PythonCount', 'FileCount', 'Difference', 'Match', 'CreatedAt'
-    ]]
+    # Export (exports the files currently shown)
+    export_df = view_df[table_cols]
     st.download_button(
         label="Download Comparison (CSV)",
         data=export_df.to_csv(index=False),
-        file_name=f"barcode_comparison_{company_code}_{date_from}_{date_to}.csv",
+        file_name=f"barcode_comparison_{date_from}_{date_to}.csv",
         mime="text/csv",
         use_container_width=True
     )
 
     with st.expander("Help & Troubleshooting"):
         st.markdown("""
-        ### How Inlite Barcode Count Works:
+        ### How Barcodes Are Matched:
 
-        A record counts as an Inlite barcode only when its **BarcodeScanBy** has a value.
-        Records where BarcodeScanBy is empty, None, or null were not scanned by Inlite.
-        Their repair order is entered another way, so they are not counted.
+        Each barcode is identified by its **page number** and **repair order**.
+
+        - **Inlite**: the repair order is the **RecordKey**, and the page is the endpage
+          of the split file name (for example `10102026115317_177_177.pdf` is page 177).
+          Only records with **BarcodeScanBy** filled in are counted. Records with an
+          **N/A** page are not counted.
+        - **Python**: the **pagenumber** list gives each page and its repair order
+          (`[{"page": 1, "rono": "21588659"}, ...]`). Entries with an N/A page are not counted.
+
+        A file is **MATCH** only when both sides have the same page and repair order pairs.
+        The file details view shows the missing and extra barcodes for each file.
+
+        ### Which Files Are Compared:
+
+        Only Azure Table records with a non-empty **pagenumber** are compared. Records
+        showing an empty list (`[]`) are excluded from the comparison and the counts.
+
+        ### Searching:
+
+        Type part of a file path in **Search by file path** to filter the results table.
+        The search is not case-sensitive. Clear the box to show all files again.
 
         ### Column Meanings:
 
-        - **Inlite Barcode Count**: Number of Inlite records for the file where BarcodeScanBy has a value
-        - **Python Barcode Count**: Number of barcodes detected by your Python pipeline
-        - **Files Scanned**: Number of files in the Python record's OriginalFileName list (the source PDF and its split files)
+        - **Inlite Barcode Count**: Scanned Inlite barcodes for the file with a real page number
+        - **Python Barcode Count**: Barcodes in the Python pagenumber list with a real page number
         - **Difference**: Inlite Count - Python Count
-        - **Match**: MATCH if counts match, MISMATCH if different
+        - **Match**: MATCH if every barcode pair is on both sides, MISMATCH otherwise
 
         ### Troubleshooting:
 
-        - **Inlite count is wrong**: Check the BarcodeScanBy value on the raw Inlite records for that file
-        - **No data found**: Check company code, dates, and that both systems have data
+        - **Count is wrong**: Check BarcodeScanBy, RecordKey, and the split file name on the raw Inlite records
+        - **No data found**: Check dates and that both systems have data for the selected days
         - **API Error**: Check base URL, token, and IDs
-        - **Inlite details empty**: Check that BlobBackupFilePath matches exactly between systems
+        - **Details empty**: Check that BlobBackupFilePath matches exactly between systems
         - **PDF link not working**: Ensure the blob path is accessible from your network
         """)
 
@@ -802,6 +848,8 @@ def statistics_page():
 
     total_inlite = int(comparison_df['InliteCount'].sum())
     total_python = int(comparison_df['PythonCount'].sum())
+    total_missing = int(comparison_df['MissingInPython'].sum())
+    total_extra = int(comparison_df['ExtraInPython'].sum())
     inlite_higher = int((comparison_df['Difference'] > 0).sum())
     python_higher = int((comparison_df['Difference'] < 0).sum())
 
@@ -829,6 +877,13 @@ def statistics_page():
     with t4:
         st.metric("Python Higher", python_higher)
 
+    st.subheader("Barcode Differences (Page + Repair Order)")
+    d1, d2 = st.columns(2)
+    with d1:
+        st.metric("Missing in Python", total_missing)
+    with d2:
+        st.metric("Extra in Python", total_extra)
+
     st.subheader("Match Status")
     st.bar_chart(pd.DataFrame({'Files': [matches, mismatches]}, index=['Match', 'Mismatch']))
 
@@ -840,7 +895,7 @@ def statistics_page():
         matches_df = comparison_df[comparison_df['Match'] == 'MATCH']
         if not matches_df.empty:
             st.dataframe(
-                matches_df[['BlobBackupFilePath', 'InliteCount', 'PythonCount', 'FileCount']],
+                matches_df[['BlobBackupFilePath', 'InliteCount', 'PythonCount']],
                 use_container_width=True,
                 hide_index=True
             )
