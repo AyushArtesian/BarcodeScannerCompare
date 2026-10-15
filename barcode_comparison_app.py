@@ -216,6 +216,30 @@ def get_record_page(rec):
     return page if is_valid_page(page) else None
 
 
+def get_original_filename(rec):
+    """Return the original filename(s) from the Inlite record."""
+    value = get_field(rec, ['originalfilename'])
+    if value is None:
+        return None
+    
+    if isinstance(value, str):
+        try:
+            # Try to parse as JSON array
+            items = json.loads(value.strip())
+            if isinstance(items, list):
+                return ', '.join([basename_of(item) for item in items if not is_empty_value(item)])
+        except Exception:
+            pass
+        # If not JSON, treat as comma/semicolon separated
+        items = [p.strip() for p in re.split(r'[,;\n]+', value) if p.strip()]
+        return ', '.join([basename_of(item) for item in items])
+    
+    if isinstance(value, list):
+        return ', '.join([basename_of(item) for item in value if not is_empty_value(item)])
+    
+    return basename_of(value)
+
+
 def _has_content(item):
     """True when one entry of a pagenumber list holds something (not null, '', {} or [])."""
     if isinstance(item, (dict, list)):
@@ -640,6 +664,11 @@ def render_file_details(row, records_by_path):
     ]
     inlite_na_count = sum(1 for rec in scanned_recs if get_record_page(rec) is None)
 
+    # Extract original filename(s) from the first available record
+    original_filename = None
+    if scanned_recs:
+        original_filename = get_original_filename(scanned_recs[0])
+
     inline_pairs = row['InlinePairs'] if isinstance(row['InlinePairs'], list) else []
     python_pairs = row['PythonPairs'] if isinstance(row['PythonPairs'], list) else []
 
@@ -666,7 +695,10 @@ def render_file_details(row, records_by_path):
         })
 
     with st.container(border=True):
-        st.markdown(f"**File:** `{blob_path}`")
+        st.markdown(f"**Blob Path:** `{blob_path}`")
+        
+        if original_filename:
+            st.markdown(f"**Original Filename:** `{original_filename}`")
 
         if inline_pairs == []:
             st.warning("No Inlite record found for this file in the selected date range.")
@@ -706,7 +738,7 @@ def comparison_page():
     with col1:
         date_from = st.date_input(
             "Start Date",
-            value=datetime.now().date() - timedelta(days=2),
+            value=datetime.now().date(),
             help="Select the start date for your search"
         )
     with col2:
@@ -716,20 +748,14 @@ def comparison_page():
             help="Select the end date for your search"
         )
 
-    # Validate date range: must be <= 2 days
-    date_diff = (date_to - date_from).days
-
     st.divider()
 
     if date_from > date_to:
         st.error("❌ Start Date cannot be after End Date!")
         search_button = st.button("Search & Compare", use_container_width=True, disabled=True)
-    elif date_diff > 2:
-        st.error(f"❌ Date range is {date_diff} days. Maximum allowed is 2 days.")
-        st.caption("Please select dates within 2 days of each other.")
-        search_button = st.button("Search & Compare", use_container_width=True, disabled=True)
     else:
-        st.success(f"✅ Date range is valid ({date_diff} day{'s' if date_diff != 1 else ''}) - Ready to search")
+        date_diff = (date_to - date_from).days
+        # st.success(f"✅ Ready to search ({date_diff + 1} day{'s' if date_diff != 0 else ''})")
         search_button = st.button("Search & Compare", use_container_width=True)
 
     if search_button:
