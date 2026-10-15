@@ -69,6 +69,7 @@ def init_session_state():
         'inlite_records_by_path': {},
         'inlite_total': 0,
         'python_total': 0,
+        'python_skipped': 0,
         'unique_files': 0,
     }
     for key, value in defaults.items():
@@ -215,6 +216,38 @@ def get_record_page(rec):
     return page if is_valid_page(page) else None
 
 
+def _has_content(item):
+    """True when one entry of a pagenumber list holds something (not null, '', {} or [])."""
+    if isinstance(item, (dict, list)):
+        return len(item) > 0
+    return not is_empty_value(item)
+
+
+def is_empty_pagenumber(value):
+    """True when the Azure Table pagenumber has no entries.
+
+    Treated as empty: [], [ ], [null], [""], [{}], blank, null, None, NaN.
+    A list with at least one real entry (even one with N/A pages) is not empty.
+    """
+    if is_empty_value(value):
+        return True
+
+    parsed = value
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lower() in ('[]', 'null', 'none', 'nan', ''):
+            return True
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            # Not JSON but has text, so it has content
+            return False
+
+    if isinstance(parsed, list):
+        return not any(_has_content(item) for item in parsed)
+    return is_empty_value(parsed)
+
+
 def parse_python_barcodes(pagenumber):
     """Return the Azure Table pagenumber list as (page, repair order) pairs.
 
@@ -237,21 +270,6 @@ def parse_python_barcodes(pagenumber):
         return pairs
     except Exception:
         return []
-
-
-def has_python_pagenumber(pagenumber):
-    """True when the Azure Table pagenumber is not empty (ignores '[]', blank, and null)."""
-    if is_empty_value(pagenumber):
-        return False
-    parsed = pagenumber
-    if isinstance(pagenumber, str):
-        try:
-            parsed = json.loads(pagenumber.strip())
-        except Exception:
-            return pagenumber.strip() not in ('', '[]', 'null')
-    if isinstance(parsed, list):
-        return len(parsed) > 0
-    return not is_empty_value(parsed)
 
 
 def count_barcode_differences(inline_pairs, python_pairs):
@@ -384,7 +402,15 @@ def compare_results(inlite_df, python_df):
 
     Inlite: RecordKey is the repair order, the split file name endpage is the page.
     Python: pagenumber holds [{"page": n, "rono": "..."}].
+
+    Azure rows with an empty pagenumber are removed first and never appear.
+    Every remaining Azure row appears in the result exactly once. A row with no
+    matching Inlite file is kept with an Inlite count of 0.
     """
+    # Remove Azure rows whose pagenumber is empty (safety check, also done in run_search)
+    if not python_df.empty and 'pagenumber' in python_df.columns:
+        python_df = python_df[~python_df['pagenumber'].apply(is_empty_pagenumber)].reset_index(drop=True)
+
     if inlite_df.empty and python_df.empty:
         return pd.DataFrame()
 
@@ -479,33 +505,37 @@ def compare_results(inlite_df, python_df):
 
             python_data = python_data[PYTHON_MERGE_COLS].copy()
 
-        # ---------- Match files: same file and same day first, then file only ----------
-        comparison = pd.merge(
-            inlite_data,
-            python_data,
-            on=['BlobBackupFilePath', 'DateKey'],
-            how='inner'
+        # Row id so every Azure row can be tracked through the matching steps
+        python_data = python_data.reset_index(drop=True)
+        python_data['_py_row'] = python_data.index
+
+        # ---------- Match every Azure row to an Inlite file ----------
+        # Step 1: same file and same day
+        exact = pd.merge(
+            python_data, inlite_data,
+            on=['BlobBackupFilePath', 'DateKey'], how='inner'
         )
+        exact_rows = set(exact['_py_row'])
+
+        # Step 2: same file, any day (only for rows step 1 did not match)
+        rest = python_data[~python_data['_py_row'].isin(exact_rows)]
+        fallback = pd.merge(
+            rest.drop(columns=['DateKey']),
+            inlite_data.drop(columns=['DateKey']),
+            on=['BlobBackupFilePath'], how='inner'
+        )
+        fallback_rows = set(fallback['_py_row'])
+
+        # Step 3: no Inlite file at all. Kept with Inlite count 0 so it is not dropped.
+        unmatched = rest[~rest['_py_row'].isin(fallback_rows)].copy()
+        unmatched['InlinePairs'] = [[] for _ in range(len(unmatched))]
+        unmatched['InliteCount'] = 0
+        unmatched['CreatedAt'] = unmatched['PythonCreatedAt']
+
+        comparison = pd.concat([exact, fallback, unmatched], ignore_index=True)
 
         if len(comparison) == 0:
-            comparison = pd.merge(
-                inlite_data,
-                python_data.drop(columns=['DateKey']),
-                on=['BlobBackupFilePath'],
-                how='inner'
-            )
-
-        if len(comparison) == 0:
-            st.error("No matching records found between Inlite and Azure data!")
-            st.write("**Debug Info:**")
-            st.write(f"Inlite records (after normalization): {len(inlite_data)}")
-            if len(inlite_data) > 0:
-                st.write("Inlite columns:", list(inlite_data.columns))
-                st.write("Inlite sample BlobBackupFilePath values:", inlite_data['BlobBackupFilePath'].head(3).tolist())
-            st.write(f"Python records (after normalization): {len(python_data)}")
-            if len(python_data) > 0:
-                st.write("Python columns:", list(python_data.columns))
-                st.write("Python sample BlobBackupFilePath values:", python_data['BlobBackupFilePath'].head(3).tolist())
+            st.error("No Azure records to compare in this date range.")
             return pd.DataFrame()
 
         # ---------- Compare barcodes ----------
@@ -540,18 +570,23 @@ def compare_results(inlite_df, python_df):
 
 
 def run_search(date_from, date_to):
-    """Fetch both sources, keep only Azure rows with a page number, build the comparison, and store it."""
+    """Fetch both sources, drop Azure rows with an empty pagenumber, build the comparison, and store it."""
     inlite_df = fetch_inlite_data(date_from, date_to)
     python_df = fetch_python_data(date_from, date_to)
 
-    # Compare only files whose Azure Table pagenumber is not empty
+    python_total = len(python_df)
+
+    # Remove Azure rows whose pagenumber is empty ([], blank, null)
     if not python_df.empty and 'pagenumber' in python_df.columns:
-        python_df = python_df[python_df['pagenumber'].apply(has_python_pagenumber)].reset_index(drop=True)
+        python_df = python_df[~python_df['pagenumber'].apply(is_empty_pagenumber)].reset_index(drop=True)
+    python_skipped = python_total - len(python_df)
 
     # Debug info
     st.write(f"**Debug - Raw Record Counts:**")
     st.write(f"- Inlite API returned: {len(inlite_df)} records")
-    st.write(f"- Azure Table returned (with pagenumber): {len(python_df)} records")
+    st.write(f"- Azure Table in date range: {python_total} records")
+    st.write(f"- Azure rows skipped (empty pagenumber): {python_skipped}")
+    st.write(f"- Azure rows compared: {len(python_df)}")
 
     # Index raw Inlite records by file path for the details view
     records_by_path = {}
@@ -573,7 +608,8 @@ def run_search(date_from, date_to):
     st.session_state.comparison_df = comparison
     st.session_state.inlite_records_by_path = records_by_path
     st.session_state.inlite_total = len(inlite_df)
-    st.session_state.python_total = len(python_df)
+    st.session_state.python_total = python_total
+    st.session_state.python_skipped = python_skipped
     st.session_state.unique_files = len(unique_paths)
     st.session_state.searched = True
 
@@ -587,7 +623,8 @@ def render_sidebar_summary():
             st.caption("Run a search to see record counts.")
             return
         st.metric("Inlite Records", st.session_state.inlite_total)
-        st.metric("Python Records", st.session_state.python_total)
+        st.metric("Python Records (in range)", st.session_state.python_total)
+        st.metric("Python Skipped (empty pagenumber)", st.session_state.python_skipped)
         st.metric("Total Unique Files", st.session_state.unique_files)
 
 
@@ -630,6 +667,9 @@ def render_file_details(row, records_by_path):
 
     with st.container(border=True):
         st.markdown(f"**File:** `{blob_path}`")
+
+        if inline_pairs == []:
+            st.warning("No Inlite record found for this file in the selected date range.")
 
         m1, m2, m3, m4, m5 = st.columns(5)
         with m1:
@@ -712,6 +752,11 @@ def comparison_page():
 
     # Results table with search and a View option
     st.subheader(f"Comparison Results ({len(comparison_df)} records)")
+    st.caption(
+        f"Azure rows in date range: {st.session_state.python_total}  |  "
+        f"Skipped (empty pagenumber): {st.session_state.python_skipped}  |  "
+        f"Compared: {len(comparison_df)}"
+    )
 
     search_text = st.text_input(
         "Search by file path",
@@ -803,8 +848,12 @@ def comparison_page():
 
         ### Which Files Are Compared:
 
-        Only Azure Table records with a non-empty **pagenumber** are compared. Records
-        showing an empty list (`[]`) are excluded from the comparison and the counts.
+        Azure Table records with an empty **pagenumber** (`[]`, blank, or null) are removed
+        before comparison and never appear in the results. The caption above the table shows
+        how many were skipped.
+
+        If an Azure file has no matching Inlite file in the date range, it still appears in the
+        results with an Inlite Barcode Count of 0 and status **MISMATCH**.
 
         ### Searching:
 
@@ -823,7 +872,6 @@ def comparison_page():
         - **Count is wrong**: Check BarcodeScanBy, RecordKey, and the split file name on the raw Inlite records
         - **No data found**: Check dates and that both systems have data for the selected days
         - **API Error**: Check base URL, token, and IDs
-        - **Details empty**: Check that BlobBackupFilePath matches exactly between systems
         - **PDF link not working**: Ensure the blob path is accessible from your network
         """)
 
