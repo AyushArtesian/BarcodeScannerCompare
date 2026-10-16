@@ -15,6 +15,7 @@ load_dotenv()
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:58531").rstrip("/")
 API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN", "")
 AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
+AZURE_STORAGE_SAS_TOKEN = os.getenv("AZURE_STORAGE_SAS_TOKEN", "")
 AZURE_TABLE_NAME = os.getenv("AZURE_TABLE_NAME", "BarcodeScanResults")
 
 # Split PDF names look like abc_startpage_endpage.pdf (e.g. Booklet_21615575_1_7.pdf)
@@ -53,12 +54,16 @@ with st.sidebar:
 
     st.subheader("Azure Table Storage")
     st.caption("Connection string: Loaded from .env" if AZURE_STORAGE_CONNECTION_STRING else "Connection string: Missing from .env")
+    st.caption("SAS token: Loaded from .env" if AZURE_STORAGE_SAS_TOKEN else "SAS token: Missing from .env (needed for PDF viewing)")
     st.info(f"Table: **{AZURE_TABLE_NAME}**")
     st.divider()
     if API_BASE_URL and API_BEARER_TOKEN and AZURE_STORAGE_CONNECTION_STRING:
-        st.success("Configuration loaded. Ready to compare!")
+        if AZURE_STORAGE_SAS_TOKEN:
+            st.success("")
+        else:
+            st.warning("⚠️ Configuration loaded, but SAS token missing. PDF viewing won't work.")
     else:
-        st.warning("Set API_BASE_URL, API_BEARER_TOKEN, and AZURE_STORAGE_CONNECTION_STRING in your .env file.")
+        st.warning("Set API_BASE_URL, API_BEARER_TOKEN, AZURE_STORAGE_CONNECTION_STRING, and AZURE_STORAGE_SAS_TOKEN in your .env file.")
 
 
 # Session state (keeps search results across reruns and pages)
@@ -238,6 +243,32 @@ def get_original_filename(rec):
         return ', '.join([basename_of(item) for item in value if not is_empty_value(item)])
     
     return basename_of(value)
+
+
+def get_temporary_pdf_uri(blob_path):
+    """Build a blob URI with the SAS token from .env
+    
+    Takes the blob path and appends the pre-generated SAS token.
+    Also adds response-content-disposition=inline to open in browser instead of downloading.
+    Returns the full URI or None if token is missing.
+    """
+    if not AZURE_STORAGE_SAS_TOKEN:
+        return None
+    
+    blob_path_str = str(blob_path).strip()
+    # Remove leading/trailing slashes
+    blob_path_str = blob_path_str.strip('/')
+    
+    # Build the full blob URI
+    blob_uri = f"https://alynkprodstorage.blob.core.windows.net/{blob_path_str}"
+    
+    # Append the SAS token (handle both with and without leading ?)
+    sas_token = AZURE_STORAGE_SAS_TOKEN.strip()
+    if not sas_token.startswith('?'):
+        sas_token = f"?{sas_token}"
+    
+    # Add response-content-disposition=inline to open in browser instead of downloading
+    return f"{blob_uri}{sas_token}&response-content-disposition=inline"
 
 
 def _has_content(item):
@@ -816,6 +847,12 @@ def comparison_page():
         .dt.strftime('%Y-%m-%d %H:%M:%S')
         .fillna('N/A')
     )
+    
+    # Add View PDF column with links
+    table_df['View PDF'] = table_df['BlobBackupFilePath'].apply(
+        lambda path: get_temporary_pdf_uri(path)
+    )
+    
     table_df.insert(0, 'View', False)
 
     # Key includes the search text so View ticks reset when the filter changes
@@ -824,9 +861,10 @@ def comparison_page():
         key=f"results_editor_{search_text.strip().lower()}",
         hide_index=True,
         use_container_width=True,
-        disabled=[c for c in table_df.columns if c != 'View'],
+        disabled=[c for c in table_df.columns if c not in ['View', 'View PDF']],
         column_config={
             'View': st.column_config.CheckboxColumn('View', help='Show details for this file', default=False),
+            'View PDF': st.column_config.LinkColumn('View PDF', display_text='📄 Open'),
             'BlobBackupFilePath': st.column_config.TextColumn('File Path', width='large'),
             'InliteCount': st.column_config.NumberColumn('Inlite Barcode Count', format='%d'),
             'PythonCount': st.column_config.NumberColumn('Python Barcode Count', format='%d'),
@@ -846,8 +884,8 @@ def comparison_page():
 
     st.divider()
 
-    # Export (exports the files currently shown)
-    export_df = view_df[table_cols]
+    # Export (exports the files currently shown, excluding the PDF link column)
+    export_df = view_df[table_cols]  # Use original table_cols without View PDF
     st.download_button(
         label="Download Comparison (CSV)",
         data=export_df.to_csv(index=False),
