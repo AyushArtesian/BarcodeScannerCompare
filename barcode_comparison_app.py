@@ -21,6 +21,12 @@ AZURE_TABLE_NAME = os.getenv("AZURE_TABLE_NAME", "BarcodeScanResults")
 # Split PDF names look like abc_startpage_endpage.pdf (e.g. Booklet_21615575_1_7.pdf)
 SPLIT_FILE_PATTERN = re.compile(r'^(.+)_(\d+)_(\d+)\.pdf$', re.IGNORECASE)
 
+# File names containing any of these (case-sensitive) text always use page 1.
+#   SCHOSC8113550101418817_1_7.pdf  -> page 1 (not 7)
+#   10152026123812_S_12923.pdf      -> page 1
+PAGE_ONE_MARKERS = ('SCHO', '_S_')
+PAGE_ONE = 1
+
 # BarcodeScanBy values that mean "not scanned by Inlite"
 NOT_SCANNED_VALUES = {'', 'none', 'null', 'nan'}
 
@@ -171,6 +177,18 @@ def basename_of(name):
     return str(name).replace('\\', '/').split('/')[-1].strip()
 
 
+def is_page_one_file(name):
+    """True when the FILE NAME (not its folder) contains SCHO or _S_ (uppercase).
+
+    Such files always have their barcode on page 1. Folder names are ignored,
+    so a folder such as SchompAutoGroup does not count.
+    """
+    if is_empty_value(name):
+        return False
+    file_name = basename_of(name)
+    return any(marker in file_name for marker in PAGE_ONE_MARKERS)
+
+
 def get_first_original_filename(value):
     """Return the first file name from the Azure Table OriginalFileName list.
 
@@ -240,9 +258,15 @@ def find_endpage_in_record(rec):
 def get_record_page(rec):
     """Return the Inlite record's page number, or None if it is missing or N/A.
 
-    Inlite has no page field, so the page comes from the endpage of the split
-    file name. An explicit N/A is never replaced, it is excluded.
+    Files with SCHO or _S_ in their file name are always page 1. All other files
+    use the endpage of the split file name, since Inlite has no page field. An
+    explicit N/A is never replaced, it is excluded.
     """
+    file_path = get_field(rec, ['blobbackupfilepath'])
+    original = get_field(rec, ['originalfilename'])
+    if is_page_one_file(file_path) or is_page_one_file(original):
+        return PAGE_ONE
+
     page = get_field(rec, ['pagenumber', 'page', 'pageno', 'pagenum'])
     if page is None:
         page = find_endpage_in_record(rec)
@@ -251,26 +275,26 @@ def get_record_page(rec):
 
 def get_temporary_pdf_uri(blob_path):
     """Build a blob URI with the SAS token from .env
-    
+
     Takes the blob path and appends the pre-generated SAS token.
     Also adds response-content-disposition=inline to open in browser instead of downloading.
     Returns the full URI or None if token is missing.
     """
     if not AZURE_STORAGE_SAS_TOKEN:
         return None
-    
+
     blob_path_str = str(blob_path).strip()
     # Remove leading/trailing slashes
     blob_path_str = blob_path_str.strip('/')
-    
+
     # Build the full blob URI
     blob_uri = f"https://alynkprodstorage.blob.core.windows.net/{blob_path_str}"
-    
+
     # Append the SAS token (handle both with and without leading ?)
     sas_token = AZURE_STORAGE_SAS_TOKEN.strip()
     if not sas_token.startswith('?'):
         sas_token = f"?{sas_token}"
-    
+
     # Add response-content-disposition=inline to open in browser instead of downloading
     return f"{blob_uri}{sas_token}&response-content-disposition=inline"
 
@@ -459,7 +483,8 @@ def fetch_python_data(date_from, date_to):
 def compare_results(inlite_df, python_df):
     """Compare barcodes per file as (page, repair order) pairs.
 
-    Inlite: RecordKey is the repair order, the split file name endpage is the page.
+    Inlite: RecordKey is the repair order. The page is 1 for files with SCHO or _S_
+    in the file name, otherwise the endpage of the split file name.
     Python: pagenumber holds [{"page": n, "rono": "..."}].
 
     Azure rows with an empty pagenumber are removed first and never appear.
@@ -541,7 +566,7 @@ def compare_results(inlite_df, python_df):
             agg_dict = {'CreatedAt': 'min'}
             if 'PageCount' in inlite_data_source.columns:
                 agg_dict['PageCount'] = 'first'  # PageCount is same for all records of same file
-            
+
             inlite_data = (
                 inlite_data_source
                 .groupby(['BlobBackupFilePath'], as_index=False)
@@ -552,7 +577,7 @@ def compare_results(inlite_df, python_df):
             )
             inlite_data['InliteCount'] = inlite_data['InlinePairs'].apply(len)
             inlite_data['DateKey'] = inlite_data['CreatedAt'].dt.date
-            
+
             # Ensure PageCount column exists
             if 'PageCount' not in inlite_data.columns:
                 inlite_data['PageCount'] = 0
@@ -636,7 +661,7 @@ def compare_results(inlite_df, python_df):
             'Difference', 'MissingInPython', 'ExtraInPython', 'Match',
             'CreatedAt', 'InlinePairs', 'PythonPairs'
         ]
-        
+
         # Fill missing PageCount values with 0
         if 'PageCount' in comparison.columns:
             comparison['PageCount'] = comparison['PageCount'].fillna(0).astype(int)
@@ -755,7 +780,7 @@ def render_file_details(row, records_by_path):
 
     with st.container(border=True):
         st.markdown(f"**Blob Path:** `{blob_path}`")
-        
+
         if original_filename:
             st.markdown(f"**Original Filename:** `{original_filename}`")
 
@@ -875,12 +900,12 @@ def comparison_page():
         .dt.strftime('%Y-%m-%d %H:%M:%S')
         .fillna('N/A')
     )
-    
+
     # Add View PDF column with links
     table_df['View PDF'] = table_df['BlobBackupFilePath'].apply(
         lambda path: get_temporary_pdf_uri(path)
     )
-    
+
     table_df.insert(0, 'View', False)
 
     # Key includes the search text so View ticks reset when the filter changes
@@ -930,10 +955,12 @@ def comparison_page():
 
         Each barcode is identified by its **page number** and **repair order**.
 
-        - **Inlite**: the repair order is the **RecordKey**, and the page is the endpage
-          of the split file name (for example `10102026115317_177_177.pdf` is page 177).
-          Only records with **BarcodeScanBy** filled in are counted. Records with an
-          **N/A** page are not counted.
+        - **Inlite**: the repair order is the **RecordKey**. Files with **SCHO** or **_S_**
+          in the file name (uppercase, for example `SCHOSC8113550101418817_1_7.pdf` or
+          `10152026123812_S_12923.pdf`) use page **1**. For all other files, the page is
+          the endpage of the split file name (for example `10102026115317_177_177.pdf` is
+          page 177). Only records with **BarcodeScanBy** filled in are counted. Records
+          with an **N/A** page are not counted.
         - **Python**: the **pagenumber** list gives each page and its repair order
           (`[{"page": 1, "rono": "21588659"}, ...]`). Entries with an N/A page are not counted.
 
