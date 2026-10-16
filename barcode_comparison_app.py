@@ -27,6 +27,11 @@ SPLIT_FILE_PATTERN = re.compile(r'^(.+)_(\d+)_(\d+)\.pdf$', re.IGNORECASE)
 PAGE_ONE_MARKERS = ('SCHO', '_S_')
 PAGE_ONE = 1
 
+# Mirrors the FileBunker rule:
+#   fileNameArray.Length > 1 && fileNameArray[0].ToLower().Contains("booklet")
+# Booklet files always use page 1 (e.g. Booklet_1245435.pdf -> page 1).
+BOOKLET_MARKER = 'booklet'
+
 # BarcodeScanBy values that mean "not scanned by Inlite"
 NOT_SCANNED_VALUES = {'', 'none', 'null', 'nan'}
 
@@ -107,8 +112,7 @@ def is_empty_value(value):
 def is_barcode_scanned_by_inlite(value):
     """True only when Inlite's BarcodeScanBy has a real value.
 
-    None, blank, NaN, 'none', and 'null' mean the barcode was not scanned by Inlite,
-    so that record is not counted. Its repair order is entered by another method.
+    None, blank, NaN, 'none', and 'null' mean the barcode was not scanned by Inlite.
     """
     if is_empty_value(value):
         return False
@@ -177,8 +181,21 @@ def basename_of(name):
     return str(name).replace('\\', '/').split('/')[-1].strip()
 
 
+def is_booklet_file_name(name):
+    """True when the file name splits into more than one '_' part and the first part contains 'booklet'.
+
+    Mirrors the FileBunker rule:
+        fileNameArray.Length > 1 && fileNameArray[0].ToLower().Contains("booklet")
+    """
+    if is_empty_value(name):
+        return False
+    parts = basename_of(name).split('_')
+    return len(parts) > 1 and BOOKLET_MARKER in parts[0].lower()
+
+
 def is_page_one_file(name):
-    """True when the FILE NAME (not its folder) contains SCHO or _S_ (uppercase).
+    """True when the FILE NAME (not its folder) contains SCHO or _S_ (uppercase),
+    or is a Booklet file.
 
     Such files always have their barcode on page 1. Folder names are ignored,
     so a folder such as SchompAutoGroup does not count.
@@ -186,7 +203,29 @@ def is_page_one_file(name):
     if is_empty_value(name):
         return False
     file_name = basename_of(name)
-    return any(marker in file_name for marker in PAGE_ONE_MARKERS)
+    if any(marker in file_name for marker in PAGE_ONE_MARKERS):
+        return True
+    return is_booklet_file_name(file_name)
+
+
+def is_booklet_record(rec):
+    """True when the record's original or source file name is a Booklet file.
+
+    Checks OriginalFileName and sourceFilePath, since the blob path is a
+    generated name that does not show the original file name.
+    """
+    for candidate in (['originalfilename'], ['sourcefilepath']):
+        if is_booklet_file_name(get_field(rec, candidate)):
+            return True
+    return False
+
+
+def is_countable_inlite_record(rec):
+    """True when an Inlite record should be counted as a barcode.
+
+    Counted when BarcodeScanBy has a value, or when the file is a Booklet file.
+    """
+    return is_barcode_scanned_by_inlite(get_field(rec, ['barcodescanby'])) or is_booklet_record(rec)
 
 
 def get_first_original_filename(value):
@@ -258,13 +297,14 @@ def find_endpage_in_record(rec):
 def get_record_page(rec):
     """Return the Inlite record's page number, or None if it is missing or N/A.
 
-    Files with SCHO or _S_ in their file name are always page 1. All other files
-    use the endpage of the split file name, since Inlite has no page field. An
-    explicit N/A is never replaced, it is excluded.
+    Files with SCHO or _S_ in their file name, and all Booklet files, are always
+    page 1. All other files use the endpage of the split file name, since Inlite
+    has no page field. An explicit N/A is never replaced, it is excluded.
     """
     file_path = get_field(rec, ['blobbackupfilepath'])
     original = get_field(rec, ['originalfilename'])
-    if is_page_one_file(file_path) or is_page_one_file(original):
+    source = get_field(rec, ['sourcefilepath'])
+    if is_page_one_file(file_path) or is_page_one_file(original) or is_page_one_file(source):
         return PAGE_ONE
 
     page = get_field(rec, ['pagenumber', 'page', 'pageno', 'pagenum'])
@@ -483,8 +523,9 @@ def fetch_python_data(date_from, date_to):
 def compare_results(inlite_df, python_df):
     """Compare barcodes per file as (page, repair order) pairs.
 
-    Inlite: RecordKey is the repair order. The page is 1 for files with SCHO or _S_
-    in the file name, otherwise the endpage of the split file name.
+    Inlite: RecordKey is the repair order. Records are counted when BarcodeScanBy
+    has a value or the file is a Booklet file. The page is 1 for SCHO, _S_, and
+    Booklet files, otherwise the endpage of the split file name.
     Python: pagenumber holds [{"page": n, "rono": "..."}].
 
     Azure rows with an empty pagenumber are removed first and never appear.
@@ -538,9 +579,7 @@ def compare_results(inlite_df, python_df):
             if 'RecordKey' not in inlite_data_source.columns:
                 inlite_data_source['RecordKey'] = None
             if 'BarcodeScanBy' not in inlite_data_source.columns:
-                st.error("Inlite API response has no BarcodeScanBy column, so Inlite barcodes cannot be counted.")
-                st.write("Available columns:", list(inlite_data_source.columns))
-                return pd.DataFrame()
+                inlite_data_source['BarcodeScanBy'] = None
 
             if 'PageCount' not in inlite_data_source.columns:
                 inlite_data_source['PageCount'] = 0
@@ -549,11 +588,13 @@ def compare_results(inlite_df, python_df):
                 inlite_data_source['CreatedAt'], errors='coerce', utc=True
             )
 
-            # Only rows scanned by Inlite (BarcodeScanBy has a value) are counted.
-            scanned_mask = inlite_data_source['BarcodeScanBy'].apply(is_barcode_scanned_by_inlite)
+            # Count rows with BarcodeScanBy filled in, plus all Booklet rows
+            scanned_mask = inlite_data_source.apply(
+                lambda row: is_countable_inlite_record(row.to_dict()), axis=1
+            )
             scanned_rows = inlite_data_source[scanned_mask].copy()
 
-            # One (page, repair order) pair per scanned record. N/A pages are skipped.
+            # One (page, repair order) pair per counted record. N/A pages are skipped.
             pairs_by_file = {}
             for rec in scanned_rows.to_dict('records'):
                 pair = make_barcode_pair(get_record_page(rec), get_field(rec, ['recordkey']))
@@ -743,12 +784,9 @@ def render_file_details(row, records_by_path):
     blob_path = row['BlobBackupFilePath']
     all_recs = records_by_path.get(str(blob_path).strip().lower(), [])
 
-    # Inlite records that were scanned by Inlite
-    scanned_recs = [
-        rec for rec in all_recs
-        if is_barcode_scanned_by_inlite(get_field(rec, ['barcodescanby']))
-    ]
-    inlite_na_count = sum(1 for rec in scanned_recs if get_record_page(rec) is None)
+    # Inlite records that are counted as barcodes
+    counted_recs = [rec for rec in all_recs if is_countable_inlite_record(rec)]
+    inlite_na_count = sum(1 for rec in counted_recs if get_record_page(rec) is None)
 
     # First file name from the Azure Table OriginalFileName list
     original_filename = None if is_empty_value(row.get('OriginalFileName')) else row['OriginalFileName']
@@ -955,12 +993,18 @@ def comparison_page():
 
         Each barcode is identified by its **page number** and **repair order**.
 
-        - **Inlite**: the repair order is the **RecordKey**. Files with **SCHO** or **_S_**
-          in the file name (uppercase, for example `SCHOSC8113550101418817_1_7.pdf` or
-          `10152026123812_S_12923.pdf`) use page **1**. For all other files, the page is
-          the endpage of the split file name (for example `10102026115317_177_177.pdf` is
-          page 177). Only records with **BarcodeScanBy** filled in are counted. Records
-          with an **N/A** page are not counted.
+        - **Inlite**: the repair order is the **RecordKey**. A record is counted when
+          **BarcodeScanBy** is filled in, or when its file name's first part (before the
+          first `_`) contains **Booklet**, for example `Booklet_1245435.pdf`, even if
+          BarcodeScanBy is empty.
+          The barcode page is **1** for these files:
+          - Files with **SCHO** in the file name (for example `SCHOSC8113550101418817_1_7.pdf`)
+          - Files with **_S_** in the file name (for example `10152026123812_S_12923.pdf`)
+          - Booklet files (for example `Booklet_1245435.pdf`)
+
+          For all other files, the page is the endpage of the split file name
+          (for example `10102026115317_177_177.pdf` is page 177). Records with an
+          **N/A** page are not counted.
         - **Python**: the **pagenumber** list gives each page and its repair order
           (`[{"page": 1, "rono": "21588659"}, ...]`). Entries with an N/A page are not counted.
 
@@ -988,7 +1032,7 @@ def comparison_page():
 
         ### Column Meanings:
 
-        - **Inlite Barcode Count**: Scanned Inlite barcodes for the file with a real page number
+        - **Inlite Barcode Count**: Counted Inlite barcodes for the file with a real page number
         - **Python Barcode Count**: Barcodes in the Python pagenumber list with a real page number
         - **Difference**: Inlite Count - Python Count
         - **Match**: MATCH if every barcode pair is on both sides, MISMATCH otherwise
