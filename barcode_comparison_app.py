@@ -29,7 +29,7 @@ NA_PAGE_VALUES = {'', 'n/a', 'na', 'none', 'null', 'nan'}
 
 # Columns kept from the Azure Table side before merging
 PYTHON_MERGE_COLS = [
-    'BlobBackupFilePath', 'PythonCount', 'PythonCreatedAt', 'PythonPairs', 'DateKey'
+    'BlobBackupFilePath', 'OriginalFileName', 'PythonCount', 'PythonCreatedAt', 'PythonPairs', 'DateKey'
 ]
 
 
@@ -59,7 +59,7 @@ with st.sidebar:
     st.divider()
     if API_BASE_URL and API_BEARER_TOKEN and AZURE_STORAGE_CONNECTION_STRING:
         if AZURE_STORAGE_SAS_TOKEN:
-            st.success("")
+            st.success("✅ Configuration loaded. Ready to compare and view PDFs!")
         else:
             st.warning("⚠️ Configuration loaded, but SAS token missing. PDF viewing won't work.")
     else:
@@ -171,6 +171,34 @@ def basename_of(name):
     return str(name).replace('\\', '/').split('/')[-1].strip()
 
 
+def get_first_original_filename(value):
+    """Return the first file name from the Azure Table OriginalFileName list.
+
+    Handles a JSON list string, a real list, a dict with fileName, or a
+    comma/semicolon separated string.
+    """
+    if is_empty_value(value):
+        return None
+
+    items = value
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            items = json.loads(text)
+        except Exception:
+            items = [p for p in re.split(r'[,;\n]+', text) if p.strip()]
+
+    if not isinstance(items, list):
+        items = [items]
+
+    for item in items:
+        if isinstance(item, dict):
+            item = item.get('fileName') or item.get('FileName') or item.get('name')
+        if not is_empty_value(item):
+            return basename_of(item)
+    return None
+
+
 def parse_split_filename(name):
     """Return (startpage, endpage) from a name like abc_1_7.pdf, or None.
 
@@ -219,30 +247,6 @@ def get_record_page(rec):
     if page is None:
         page = find_endpage_in_record(rec)
     return page if is_valid_page(page) else None
-
-
-def get_original_filename(rec):
-    """Return the original filename(s) from the Inlite record."""
-    value = get_field(rec, ['originalfilename'])
-    if value is None:
-        return None
-    
-    if isinstance(value, str):
-        try:
-            # Try to parse as JSON array
-            items = json.loads(value.strip())
-            if isinstance(items, list):
-                return ', '.join([basename_of(item) for item in items if not is_empty_value(item)])
-        except Exception:
-            pass
-        # If not JSON, treat as comma/semicolon separated
-        items = [p.strip() for p in re.split(r'[,;\n]+', value) if p.strip()]
-        return ', '.join([basename_of(item) for item in items])
-    
-    if isinstance(value, list):
-        return ', '.join([basename_of(item) for item in value if not is_empty_value(item)])
-    
-    return basename_of(value)
 
 
 def get_temporary_pdf_uri(blob_path):
@@ -486,6 +490,7 @@ def compare_results(inlite_df, python_df):
                 'createdat': 'CreatedAt',
                 'recordkey': 'RecordKey',
                 'barcodescanby': 'BarcodeScanBy',
+                'pagecount': 'PageCount',
             }
 
             rename_dict = {}
@@ -512,6 +517,9 @@ def compare_results(inlite_df, python_df):
                 st.write("Available columns:", list(inlite_data_source.columns))
                 return pd.DataFrame()
 
+            if 'PageCount' not in inlite_data_source.columns:
+                inlite_data_source['PageCount'] = 0
+
             inlite_data_source['CreatedAt'] = pd.to_datetime(
                 inlite_data_source['CreatedAt'], errors='coerce', utc=True
             )
@@ -529,16 +537,25 @@ def compare_results(inlite_df, python_df):
                 file_key = str(rec.get('BlobBackupFilePath', '')).strip()
                 pairs_by_file.setdefault(file_key, []).append(pair)
 
+            # Prepare aggregation dict
+            agg_dict = {'CreatedAt': 'min'}
+            if 'PageCount' in inlite_data_source.columns:
+                agg_dict['PageCount'] = 'first'  # PageCount is same for all records of same file
+            
             inlite_data = (
                 inlite_data_source
                 .groupby(['BlobBackupFilePath'], as_index=False)
-                .agg(CreatedAt=('CreatedAt', 'min'))
+                .agg(agg_dict)
             )
             inlite_data['InlinePairs'] = inlite_data['BlobBackupFilePath'].apply(
                 lambda p: list(pairs_by_file.get(str(p).strip(), []))
             )
             inlite_data['InliteCount'] = inlite_data['InlinePairs'].apply(len)
             inlite_data['DateKey'] = inlite_data['CreatedAt'].dt.date
+            
+            # Ensure PageCount column exists
+            if 'PageCount' not in inlite_data.columns:
+                inlite_data['PageCount'] = 0
 
         # ---------- Normalize Azure Table data ----------
         if python_df.empty:
@@ -552,6 +569,12 @@ def compare_results(inlite_df, python_df):
                 st.error(f"Azure Table missing columns: {missing}")
                 st.write("Available columns:", list(python_data.columns))
                 return pd.DataFrame()
+
+            # First file name from the Azure Table OriginalFileName list
+            orig_col = find_column(python_data, ['originalfilename'])
+            python_data['OriginalFileName'] = (
+                python_data[orig_col].apply(get_first_original_filename) if orig_col else None
+            )
 
             python_data['PythonPairs'] = python_data['pagenumber'].apply(parse_python_barcodes)
             python_data['PythonCount'] = python_data['PythonPairs'].apply(len)
@@ -585,6 +608,7 @@ def compare_results(inlite_df, python_df):
         unmatched = rest[~rest['_py_row'].isin(fallback_rows)].copy()
         unmatched['InlinePairs'] = [[] for _ in range(len(unmatched))]
         unmatched['InliteCount'] = 0
+        unmatched['PageCount'] = 0
         unmatched['CreatedAt'] = unmatched['PythonCreatedAt']
 
         comparison = pd.concat([exact, fallback, unmatched], ignore_index=True)
@@ -608,10 +632,16 @@ def compare_results(inlite_df, python_df):
         ]
 
         final_cols = [
-            'BlobBackupFilePath', 'InliteCount', 'PythonCount',
+            'BlobBackupFilePath', 'OriginalFileName', 'InliteCount', 'PythonCount', 'PageCount',
             'Difference', 'MissingInPython', 'ExtraInPython', 'Match',
             'CreatedAt', 'InlinePairs', 'PythonPairs'
         ]
+        
+        # Fill missing PageCount values with 0
+        if 'PageCount' in comparison.columns:
+            comparison['PageCount'] = comparison['PageCount'].fillna(0).astype(int)
+        else:
+            comparison['PageCount'] = 0
 
         return (
             comparison[final_cols]
@@ -695,10 +725,8 @@ def render_file_details(row, records_by_path):
     ]
     inlite_na_count = sum(1 for rec in scanned_recs if get_record_page(rec) is None)
 
-    # Extract original filename(s) from the first available record
-    original_filename = None
-    if scanned_recs:
-        original_filename = get_original_filename(scanned_recs[0])
+    # First file name from the Azure Table OriginalFileName list
+    original_filename = None if is_empty_value(row.get('OriginalFileName')) else row['OriginalFileName']
 
     inline_pairs = row['InlinePairs'] if isinstance(row['InlinePairs'], list) else []
     python_pairs = row['PythonPairs'] if isinstance(row['PythonPairs'], list) else []
@@ -838,7 +866,7 @@ def comparison_page():
     )
 
     table_cols = [
-        'BlobBackupFilePath', 'InliteCount', 'PythonCount',
+        'BlobBackupFilePath', 'OriginalFileName', 'PageCount', 'InliteCount', 'PythonCount',
         'Difference', 'Match', 'CreatedAt'
     ]
     table_df = view_df[table_cols].copy()
@@ -866,6 +894,8 @@ def comparison_page():
             'View': st.column_config.CheckboxColumn('View', help='Show details for this file', default=False),
             'View PDF': st.column_config.LinkColumn('View PDF', display_text='📄 Open'),
             'BlobBackupFilePath': st.column_config.TextColumn('File Path', width='large'),
+            'OriginalFileName': st.column_config.TextColumn('Original File Name', width='medium'),
+            'PageCount': st.column_config.NumberColumn('Total Pages', format='%d'),
             'InliteCount': st.column_config.NumberColumn('Inlite Barcode Count', format='%d'),
             'PythonCount': st.column_config.NumberColumn('Python Barcode Count', format='%d'),
             'Difference': st.column_config.NumberColumn('Difference', format='%d'),
@@ -918,6 +948,11 @@ def comparison_page():
 
         If an Azure file has no matching Inlite file in the date range, it still appears in the
         results with an Inlite Barcode Count of 0 and status **MISMATCH**.
+
+        ### File Name:
+
+        **Original File Name** is the first entry of the **OriginalFileName** list stored in
+        the Azure Table.
 
         ### Searching:
 
@@ -1007,7 +1042,7 @@ def statistics_page():
         matches_df = comparison_df[comparison_df['Match'] == 'MATCH']
         if not matches_df.empty:
             st.dataframe(
-                matches_df[['BlobBackupFilePath', 'InliteCount', 'PythonCount']],
+                matches_df[['BlobBackupFilePath', 'OriginalFileName', 'InliteCount', 'PythonCount']],
                 use_container_width=True,
                 hide_index=True
             )
@@ -1019,7 +1054,7 @@ def statistics_page():
         mismatches_df = comparison_df[comparison_df['Match'] == 'MISMATCH']
         if not mismatches_df.empty:
             st.dataframe(
-                mismatches_df[['BlobBackupFilePath', 'InliteCount', 'PythonCount', 'Difference']],
+                mismatches_df[['BlobBackupFilePath', 'OriginalFileName', 'InliteCount', 'PythonCount', 'Difference']],
                 use_container_width=True,
                 hide_index=True
             )
