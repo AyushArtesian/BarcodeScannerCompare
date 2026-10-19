@@ -4,3 +4,4 @@ requests
 azure-data-tables
 numpy
 python-dotenv
+pytz

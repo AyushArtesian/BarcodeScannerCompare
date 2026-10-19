@@ -8,6 +8,7 @@ import json
 import os
 import re
 from dotenv import load_dotenv
+import pytz
 
 # Load environment variables from the .env file
 load_dotenv()
@@ -40,7 +41,7 @@ NA_PAGE_VALUES = {'', 'n/a', 'na', 'none', 'null', 'nan'}
 
 # Columns kept from the Azure Table side before merging
 PYTHON_MERGE_COLS = [
-    'BlobBackupFilePath', 'OriginalFileName', 'PythonCount', 'PythonCreatedAt', 'PythonPairs', 'DateKey'
+    'BlobBackupFilePath', 'OriginalFileName', 'PythonCount', 'PythonCreatedAt', 'PythonUpdatedAt', 'PythonPairs', 'DateKey'
 ]
 
 
@@ -408,6 +409,37 @@ def count_barcode_differences(inline_pairs, python_pairs):
     return missing, extra
 
 
+def format_duration(created, updated):
+    """Return a human-readable duration string from two timestamps.
+    
+    Args:
+        created: datetime - CreatedAt timestamp
+        updated: datetime - UpdatedAt timestamp
+    
+    Returns:
+        str - Duration in format "Xd Yh Zm" or "Yh Zm" or "Zm"
+    """
+    if pd.isna(created) or pd.isna(updated):
+        return "N/A"
+    try:
+        delta = updated - created
+        if delta.total_seconds() < 0:
+            return "Invalid"
+        
+        days = delta.days
+        hours, remainder = divmod(delta.seconds, 3600)
+        minutes, _ = divmod(remainder, 60)
+        
+        if days > 0:
+            return f"{days}d {hours}h {minutes}m"
+        elif hours > 0:
+            return f"{hours}h {minutes}m"
+        else:
+            return f"{minutes}m"
+    except Exception:
+        return "N/A"
+
+
 def fetch_inlite_data(date_from, date_to):
     """Fetch data from Inlite API - date range only (no company code)"""
     try:
@@ -498,6 +530,11 @@ def fetch_python_data(date_from, date_to):
             st.error("Azure Table records do not contain a CreatedAt column.")
             st.caption(f"Available columns: {', '.join(data.columns)}")
             return pd.DataFrame()
+
+        # Handle UpdatedAt column - use CreatedAt as fallback if missing
+        if "UpdatedAt" not in data.columns:
+            st.warning("⚠️ UpdatedAt column not found in Azure Table. Using CreatedAt as fallback for duration calculation.")
+            data['UpdatedAt'] = data['CreatedAt']
 
         created_at = pd.to_datetime(data["CreatedAt"], errors="coerce", utc=True)
         start = pd.Timestamp(date_from).tz_localize("UTC")
@@ -645,6 +682,13 @@ def compare_results(inlite_df, python_df):
             python_data['PythonPairs'] = python_data['pagenumber'].apply(parse_python_barcodes)
             python_data['PythonCount'] = python_data['PythonPairs'].apply(len)
             python_data['PythonCreatedAt'] = pd.to_datetime(python_data['CreatedAt'], errors='coerce', utc=True)
+            
+            # Add UpdatedAt handling
+            python_data['PythonUpdatedAt'] = pd.to_datetime(
+                python_data.get('UpdatedAt', python_data['CreatedAt']), 
+                errors='coerce', utc=True
+            )
+            
             python_data['DateKey'] = python_data['PythonCreatedAt'].dt.date
 
             python_data = python_data[PYTHON_MERGE_COLS].copy()
@@ -700,7 +744,7 @@ def compare_results(inlite_df, python_df):
         final_cols = [
             'BlobBackupFilePath', 'OriginalFileName', 'InliteCount', 'PythonCount', 'PageCount',
             'Difference', 'MissingInPython', 'ExtraInPython', 'Match',
-            'CreatedAt', 'InlinePairs', 'PythonPairs'
+            'CreatedAt', 'Duration', 'InlinePairs', 'PythonPairs'
         ]
 
         # Fill missing PageCount values with 0
@@ -708,6 +752,18 @@ def compare_results(inlite_df, python_df):
             comparison['PageCount'] = comparison['PageCount'].fillna(0).astype(int)
         else:
             comparison['PageCount'] = 0
+
+        # Calculate Duration (UpdatedAt - CreatedAt)
+        if 'PythonUpdatedAt' in comparison.columns:
+            comparison['Duration'] = comparison.apply(
+                lambda row: format_duration(
+                    row['CreatedAt'],
+                    row.get('PythonUpdatedAt', row['CreatedAt'])
+                ),
+                axis=1
+            )
+        else:
+            comparison['Duration'] = 'N/A'
 
         return (
             comparison[final_cols]
@@ -930,17 +986,21 @@ def comparison_page():
 
     table_cols = [
         'BlobBackupFilePath', 'OriginalFileName', 'PageCount', 'InliteCount', 'PythonCount',
-        'Difference', 'Match', 'CreatedAt'
+        'Difference', 'Match', 'CreatedAt', 'Duration'
     ]
     table_df = view_df[table_cols].copy()
+    
+    # Convert UTC to IST (UTC+5:30)
+    ist = pytz.timezone('Asia/Kolkata')
     table_df['CreatedAt'] = (
         pd.to_datetime(table_df['CreatedAt'], errors='coerce', utc=True)
-        .dt.strftime('%Y-%m-%d %H:%M:%S')
+        .dt.tz_convert(ist)
+        .dt.strftime('%Y-%m-%d %H:%M:%S IST')
         .fillna('N/A')
     )
 
     # Add View PDF column with links
-    table_df['View PDF'] = table_df['BlobBackupFilePath'].apply(
+    table_df['View PDF'] = view_df['BlobBackupFilePath'].apply(
         lambda path: get_temporary_pdf_uri(path)
     )
 
@@ -963,7 +1023,8 @@ def comparison_page():
             'PythonCount': st.column_config.NumberColumn('Python Barcode Count', format='%d'),
             'Difference': st.column_config.NumberColumn('Difference', format='%d'),
             'Match': st.column_config.TextColumn('Match', width='small'),
-            'CreatedAt': st.column_config.TextColumn('Created At', width='medium'),
+            'CreatedAt': st.column_config.TextColumn('Created At (IST)', width='medium'),
+            'Duration': st.column_config.TextColumn('Duration', width='small'),
         }
     )
 
@@ -1036,6 +1097,7 @@ def comparison_page():
         - **Python Barcode Count**: Barcodes in the Python pagenumber list with a real page number
         - **Difference**: Inlite Count - Python Count
         - **Match**: MATCH if every barcode pair is on both sides, MISMATCH otherwise
+        - **Duration**: Time elapsed between CreatedAt and UpdatedAt (format: Xd Yh Zm)
 
         ### Troubleshooting:
 
@@ -1043,6 +1105,7 @@ def comparison_page():
         - **No data found**: Check dates and that both systems have data for the selected days
         - **API Error**: Check base URL, token, and IDs
         - **PDF link not working**: Ensure the blob path is accessible from your network
+        - **Duration shows N/A**: UpdatedAt column missing from Azure Table - using CreatedAt as fallback
         """)
 
 
